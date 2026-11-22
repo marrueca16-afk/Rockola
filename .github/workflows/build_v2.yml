@@ -1,0 +1,583 @@
+name: Build APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+      - name: Crear proyecto
+        run: |
+          mkdir Rockola && cd Rockola
+          cat > settings.gradle.kts <<'EOF_RK'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "Rockola"
+          include(":app")
+          EOF_RK
+          cat > build.gradle.kts <<'EOF_RK'
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF_RK
+          cat > gradle.properties <<'EOF_RK'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_RK
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_RK'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.rockola.player"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.rockola.player"
+                  minSdk = 21
+                  targetSdk = 33
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.activity:activity-ktx:1.8.2")
+              implementation("androidx.media3:media3-exoplayer:1.2.1")
+              implementation("androidx.media3:media3-session:1.2.1")
+          }
+          EOF_RK
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_RK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Rockola"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".MusicService"
+                      android:exported="true"
+                      android:foregroundServiceType="mediaPlayback">
+                      <intent-filter>
+                          <action android:name="androidx.media3.session.MediaSessionService" />
+                      </intent-filter>
+                  </service>
+
+                  <service
+                      android:name=".SpotifyListener"
+                      android:exported="true"
+                      android:label="Rockola"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF_RK
+          mkdir -p app/src/main/java/com/rockola/player
+          cat > app/src/main/java/com/rockola/player/MusicService.kt <<'EOF_RK'
+          package com.rockola.player
+
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.session.MediaSession
+          import androidx.media3.session.MediaSessionService
+
+          class MusicService : MediaSessionService() {
+              private var session: MediaSession? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val player = ExoPlayer.Builder(this)
+                      .setHandleAudioBecomingNoisy(true)
+                      .build()
+                  session = MediaSession.Builder(this, player).build()
+              }
+
+              override fun onGetSession(controllerInfo: MediaSession.ControllerInfo) = session
+
+              override fun onDestroy() {
+                  session?.run { player.release(); release() }
+                  session = null
+                  super.onDestroy()
+              }
+          }
+          EOF_RK
+          mkdir -p app/src/main/java/com/rockola/player
+          cat > app/src/main/java/com/rockola/player/MainActivity.kt <<'EOF_RK'
+          package com.rockola.player
+
+          import android.animation.ObjectAnimator
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.graphics.*
+          import android.graphics.drawable.GradientDrawable
+          import android.media.MediaMetadata as SysMeta
+          import android.media.session.MediaController as SysController
+          import android.media.session.MediaSessionManager
+          import android.media.session.PlaybackState
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewOutlineProvider
+          import android.view.animation.LinearInterpolator
+          import android.widget.*
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.core.app.NotificationManagerCompat
+          import androidx.core.content.ContextCompat
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.Player
+          import androidx.media3.session.MediaController
+          import androidx.media3.session.SessionToken
+          import java.text.SimpleDateFormat
+          import java.util.*
+
+          class MainActivity : ComponentActivity() {
+
+              private enum class Mode { FILES, SPOTIFY }
+              private var mode = Mode.FILES
+              private var player: Player? = null
+              private var controllerFuture: com.google.common.util.concurrent.ListenableFuture<MediaController>? = null
+
+              private lateinit var cover: ImageView
+              private lateinit var title: TextView
+              private lateinit var artist: TextView
+              private lateinit var playBtn: Button
+              private lateinit var clock: TextView
+              private lateinit var modeLabel: TextView
+              private lateinit var progress: ProgressBar
+              private lateinit var spin: ObjectAnimator
+              private val handler = Handler(Looper.getMainLooper())
+              private var lastKey = ""
+
+              private val picker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+                  if (uris.isNotEmpty()) {
+                      spotify()?.transportControls?.pause()
+                      mode = Mode.FILES
+                      updateModeLabel()
+                      player?.apply {
+                          setMediaItems(uris.map { MediaItem.fromUri(it) })
+                          prepare(); play()
+                      }
+                  }
+              }
+
+              private val ticker = object : Runnable {
+                  override fun run() { refresh(); updateClock(); handler.postDelayed(this, 1000) }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  buildOsUi()
+                  val token = SessionToken(this, ComponentName(this, MusicService::class.java))
+                  controllerFuture = MediaController.Builder(this, token).buildAsync().also { f ->
+                      f.addListener({ player = f.get() }, ContextCompat.getMainExecutor(this))
+                  }
+              }
+
+              override fun onStart() { super.onStart(); handler.post(ticker) }
+              override fun onStop() { handler.removeCallbacks(ticker); super.onStop() }
+              override fun onDestroy() {
+                  controllerFuture?.let { MediaController.releaseFuture(it) }
+                  super.onDestroy()
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun rounded(color: Int, radiusDp: Int, strokeColor: Int? = null, strokeDp: Int = 1): GradientDrawable {
+                  return GradientDrawable().apply {
+                      shape = GradientDrawable.RECTANGLE
+                      setColor(color)
+                      cornerRadius = dp(radiusDp).toFloat()
+                      if (strokeColor != null) setStroke(dp(strokeDp), strokeColor)
+                  }
+              }
+
+              private fun circleBg(color: Int): GradientDrawable {
+                  return GradientDrawable().apply {
+                      shape = GradientDrawable.OVAL
+                      setColor(color)
+                  }
+              }
+
+              private fun osButton(text: String, bg: Int, textColor: Int = Color.WHITE, size: Float = 16f, onClick: () -> Unit): Button {
+                  return Button(this).apply {
+                      this.text = text
+                      textSize = size
+                      setTextColor(textColor)
+                      typeface = Typeface.DEFAULT_BOLD
+                      background = rounded(bg, 14, 0x33FFFFFF)
+                      layoutParams = LinearLayout.LayoutParams(0, dp(56), 1f).apply { setMargins(dp(5), dp(5), dp(5), dp(5)) }
+                      setOnClickListener { onClick() }
+                      elevation = dp(4).toFloat()
+                  }
+              }
+
+              private fun updateModeLabel() {
+                  modeLabel.text = if (mode == Mode.SPOTIFY) "● SPOTIFY" else "● ARCHIVOS"
+                  modeLabel.setTextColor(if (mode == Mode.SPOTIFY) 0xFF1DB954.toInt() else 0xFF4FC3F7.toInt())
+              }
+
+              private fun updateClock() {
+                  val fmt = SimpleDateFormat("HH:mm", Locale.getDefault())
+                  clock.text = fmt.format(Date())
+              }
+
+              private fun buildOsUi() {
+                  // Fondo tipo escritorio de sistema operativo
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = GradientDrawable(
+                          GradientDrawable.Orientation.TL_BR,
+                          intArrayOf(0xFF0B1026.toInt(), 0xFF101A3A.toInt(), 0xFF1A0B2E.toInt())
+                      )
+                      setPadding(dp(14), dp(18), dp(14), dp(14))
+                  }
+
+                  // ===== Barra superior tipo OS =====
+                  val topBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      background = rounded(0xCC121A33.toInt(), 16, 0x33FFFFFF)
+                      setPadding(dp(14), dp(10), dp(14), dp(10))
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)).apply { bottomMargin = dp(12) }
+                      elevation = dp(6).toFloat()
+                  }
+                  val logo = TextView(this).apply {
+                      text = "⬢ ROCKOLA OS"
+                      textSize = 18f
+                      typeface = Typeface.DEFAULT_BOLD
+                      setTextColor(Color.WHITE)
+                      letterSpacing = 0.08f
+                  }
+                  val spacerTop = View(this).apply { layoutParams = LinearLayout.LayoutParams(0, 0, 1f) }
+                  modeLabel = TextView(this).apply {
+                      text = "● ARCHIVOS"
+                      textSize = 12f
+                      typeface = Typeface.DEFAULT_BOLD
+                      setTextColor(0xFF4FC3F7.toInt())
+                      background = rounded(0x221A2A4A.toInt(), 10, 0x33FFFFFF)
+                      setPadding(dp(10), dp(5), dp(10), dp(5))
+                  }
+                  clock = TextView(this).apply {
+                      text = "00:00"
+                      textSize = 15f
+                      typeface = Typeface.DEFAULT_BOLD
+                      setTextColor(0xFFB0BEC5.toInt())
+                      setPadding(dp(12), 0, 0, 0)
+                  }
+                  topBar.addView(logo)
+                  topBar.addView(spacerTop)
+                  topBar.addView(modeLabel)
+                  topBar.addView(clock)
+                  root.addView(topBar)
+
+                  // ===== Ventana principal =====
+                  val window = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      background = rounded(0xE61A2340.toInt(), 22, 0x44FFFFFF)
+                      setPadding(dp(18), dp(18), dp(18), dp(16))
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+                      elevation = dp(10).toFloat()
+                  }
+
+                  // Barra de título de ventana
+                  val winBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(28)).apply { bottomMargin = dp(14) }
+                  }
+                  val dots = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  listOf(0xFFFF5F57.toInt(), 0xFFFEBC2E.toInt(), 0xFF28C840.toInt()).forEach { c ->
+                      dots.addView(View(this@MainActivity).apply {
+                          background = circleBg(c)
+                          layoutParams = LinearLayout.LayoutParams(dp(12), dp(12)).apply { setMargins(0, 0, dp(7), 0) }
+                      })
+                  }
+                  val winTitle = TextView(this).apply {
+                      text = "Reproductor — Rockola OS"
+                      textSize = 12f
+                      setTextColor(0xFF90A4AE.toInt())
+                      setPadding(dp(8), 0, 0, 0)
+                  }
+                  winBar.addView(dots)
+                  winBar.addView(winTitle)
+                  window.addView(winBar)
+
+                  // Portada circular tipo disco
+                  val size = (resources.displayMetrics.widthPixels * 0.62).toInt().coerceAtMost(dp(260))
+                  cover = ImageView(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(size, size).apply { topMargin = dp(6) }
+                      scaleType = ImageView.ScaleType.CENTER_CROP
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(0xFF263238.toInt())
+                          setStroke(dp(4), 0xFF4FC3F7.toInt())
+                      }
+                      outlineProvider = object : ViewOutlineProvider() {
+                          override fun getOutline(v: View, o: Outline) { o.setOval(0, 0, v.width, v.height) }
+                      }
+                      clipToOutline = true
+                      elevation = dp(12).toFloat()
+                  }
+                  spin = ObjectAnimator.ofFloat(cover, View.ROTATION, 0f, 360f).apply {
+                      duration = 8000; repeatCount = ObjectAnimator.INFINITE; interpolator = LinearInterpolator()
+                  }
+                  window.addView(cover)
+
+                  title = TextView(this).apply {
+                      text = "Rockola OS"
+                      textSize = 24f
+                      typeface = Typeface.DEFAULT_BOLD
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      setSingleLine(); ellipsize = android.text.TextUtils.TruncateAt.MARQUEE; isSelected = true
+                      setPadding(0, dp(18), 0, dp(2))
+                  }
+                  artist = TextView(this).apply {
+                      text = "Elige una fuente para empezar"
+                      textSize = 15f
+                      setTextColor(0xFF90CAF9.toInt())
+                      gravity = Gravity.CENTER
+                  }
+                  window.addView(title)
+                  window.addView(artist)
+
+                  // Barra de progreso
+                  progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                      max = 1000
+                      progress = 0
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(6)).apply {
+                          topMargin = dp(16); bottomMargin = dp(4)
+                      }
+                      progressDrawable = GradientDrawable().apply {
+                          shape = GradientDrawable.RECTANGLE
+                          cornerRadius = dp(3).toFloat()
+                          setColor(0xFF4FC3F7.toInt())
+                      }
+                  }
+                  window.addView(progress)
+
+                  val times = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(10) }
+                  }
+                  val t1 = TextView(this).apply { text = "0:00"; textSize = 11f; setTextColor(0xFF90A4AE.toInt()) }
+                  val tSpacer = View(this).apply { layoutParams = LinearLayout.LayoutParams(0, 0, 1f) }
+                  val t2 = TextView(this).apply { text = "—:—"; textSize = 11f; setTextColor(0xFF90A4AE.toInt()) }
+                  times.addView(t1); times.addView(tSpacer); times.addView(t2)
+                  window.addView(times)
+
+                  // Botones de fuente (dock superior)
+                  val sources = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(6) }
+                  }
+                  sources.addView(osButton("📁  Archivos", 0xFF1E3A5F.toInt()) { picker.launch(arrayOf("audio/*")) })
+                  sources.addView(osButton("🟢  Spotify", 0xFF14532D.toInt()) { openSpotify() })
+                  window.addView(sources)
+
+                  // Controles principales (dock inferior)
+                  val controls = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) }
+                  }
+                  controls.addView(osButton("⏮", 0xFF263238.toInt(), size = 20f) { prev() })
+                  playBtn = Button(this).apply {
+                      text = "▶"
+                      textSize = 26f
+                      typeface = Typeface.DEFAULT_BOLD
+                      setTextColor(Color.WHITE)
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(0xFF7C4DFF.toInt())
+                          setStroke(dp(2), 0x66FFFFFF)
+                      }
+                      layoutParams = LinearLayout.LayoutParams(dp(76), dp(76)).apply { setMargins(dp(10), 0, dp(10), 0) }
+                      setOnClickListener { toggle() }
+                      elevation = dp(10).toFloat()
+                  }
+                  controls.addView(playBtn)
+                  controls.addView(osButton("⏭", 0xFF263238.toInt(), size = 20f) { next() })
+                  window.addView(controls)
+
+                  root.addView(window)
+
+                  // ===== Barra inferior tipo dock =====
+                  val dock = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      background = rounded(0xCC121A33.toInt(), 16, 0x33FFFFFF)
+                      setPadding(dp(10), dp(8), dp(10), dp(8))
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(58)).apply { topMargin = dp(12) }
+                      elevation = dp(6).toFloat()
+                  }
+                  val dockText = TextView(this).apply {
+                      text = "🎵  Rockola OS v2.0  •  Profesional"
+                      textSize = 12f
+                      setTextColor(0xFFB0BEC5.toInt())
+                      gravity = Gravity.CENTER
+                  }
+                  dock.addView(dockText)
+                  root.addView(dock)
+
+                  setContentView(root)
+                  updateModeLabel()
+                  updateClock()
+              }
+
+              // ---------- Spotify ----------
+              private fun hasNotifAccess() =
+                  NotificationManagerCompat.getEnabledListenerPackages(this).contains(packageName)
+
+              private fun spotify(): SysController? {
+                  if (!hasNotifAccess()) return null
+                  return try {
+                      val msm = getSystemService(MediaSessionManager::class.java)
+                      msm.getActiveSessions(ComponentName(this, SpotifyListener::class.java))
+                          .firstOrNull { it.packageName.startsWith("com.spotify") }
+                  } catch (e: SecurityException) { null }
+              }
+
+              private fun openSpotify() {
+                  if (!hasNotifAccess()) {
+                      Toast.makeText(this, "Activa el acceso a notificaciones para Rockola", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                      return
+                  }
+                  player?.pause()
+                  mode = Mode.SPOTIFY
+                  updateModeLabel()
+                  val intent = packageManager.getLaunchIntentForPackage("com.spotify.music")
+                      ?: packageManager.getLaunchIntentForPackage("com.spotify.lite")
+                  if (intent == null) Toast.makeText(this, "Instala Spotify primero", Toast.LENGTH_LONG).show()
+                  else if (spotify() == null) startActivity(intent)
+              }
+
+              // ---------- Controles ----------
+              private fun toggle() {
+                  if (mode == Mode.SPOTIFY) {
+                      val c = spotify() ?: return
+                      if (c.playbackState?.state == PlaybackState.STATE_PLAYING) c.transportControls.pause()
+                      else c.transportControls.play()
+                  } else player?.let { if (it.isPlaying) it.pause() else it.play() }
+              }
+              private fun next() { if (mode == Mode.SPOTIFY) spotify()?.transportControls?.skipToNext() else player?.seekToNext() }
+              private fun prev() { if (mode == Mode.SPOTIFY) spotify()?.transportControls?.skipToPrevious() else player?.seekToPrevious() }
+
+              private fun refresh() {
+                  var t: CharSequence? = null
+                  var a: CharSequence? = null
+                  var bmp: Bitmap? = null
+                  var playing = false
+
+                  if (mode == Mode.SPOTIFY) {
+                      val c = spotify()
+                      val m = c?.metadata
+                      t = m?.getString(SysMeta.METADATA_KEY_TITLE) ?: "Spotify: dale play en la app"
+                      a = m?.getString(SysMeta.METADATA_KEY_ARTIST)
+                      bmp = m?.getBitmap(SysMeta.METADATA_KEY_ALBUM_ART) ?: m?.getBitmap(SysMeta.METADATA_KEY_ART)
+                      playing = c?.playbackState?.state == PlaybackState.STATE_PLAYING
+                  } else {
+                      player?.let {
+                          val md = it.mediaMetadata
+                          t = md.title ?: it.currentMediaItem?.localConfiguration?.uri?.lastPathSegment
+                          a = md.artist
+                          md.artworkData?.let { d -> bmp = BitmapFactory.decodeByteArray(d, 0, d.size) }
+                          playing = it.isPlaying
+                          // progreso
+                          try {
+                              val pos = it.currentPosition
+                              val dur = it.duration
+                              if (dur > 0) progress.progress = (pos * 1000 / dur).toInt()
+                          } catch (e: Exception) { }
+                      }
+                  }
+                  val key = "$mode|$t|$a"
+                  if (key != lastKey) {
+                      lastKey = key
+                      title.text = t ?: "Rockola OS"
+                      artist.text = a ?: ""
+                      if (bmp != null) cover.setImageBitmap(bmp) else cover.setImageDrawable(null)
+                  }
+                  playBtn.text = if (playing) "⏸" else "▶"
+                  if (playing && !spin.isStarted) spin.start()
+                  else if (playing && spin.isPaused) spin.resume()
+                  else if (!playing && spin.isRunning) spin.pause()
+              }
+          }
+          EOF_RK
+          mkdir -p app/src/main/java/com/rockola/player
+          cat > app/src/main/java/com/rockola/player/SpotifyListener.kt <<'EOF_RK'
+          package com.rockola.player
+
+          import android.service.notification.NotificationListenerService
+
+          /** Vacío a propósito: solo sirve para que Android nos deje leer las sesiones de medios de Spotify. */
+          class SpotifyListener : NotificationListenerService()
+          EOF_RK
+      - name: Compilar
+        working-directory: Rockola
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Rockola-apk
+          path: Rockola/app/build/outputs/apk/debug/app-debug.apk
